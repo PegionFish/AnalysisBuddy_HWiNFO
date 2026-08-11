@@ -1,0 +1,8 @@
+{
+  "id": "hwinfo-log",
+  "display_name": "HWiNFO 硬件监控日志解析器",
+  "version": "0.1.0",
+  "entry": { "command": "python", "args": ["main.py"] },
+  "match": { "extensions": ["csv"], "header_fingerprints": ["Date,Time,"] },
+  "min_protocol_version": 1
+}
