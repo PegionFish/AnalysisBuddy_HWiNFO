@@ -98,12 +98,13 @@ def parse_timestamp(date_text: str, time_text: str, date_format: str) -> Optiona
 
 def normalize_metric_id(name: str, used: set) -> str:
     """列名 → 指标 id：去 "[...]" 单位后缀 → 小写 → 非 [a-z0-9_] 替换为 "_" →
-    连续下划线折叠 → 首尾下划线去除；与 used 冲突时追加 "_2"、"_3"... 保证唯一。"""
+    连续下划线折叠 → 首尾下划线去除；与 used 冲突时追加 "_2"、"_3"... 保证唯一。
+    规范化结果为空（如纯非 ASCII 列名"温度"）时兜底为 "col"（重名仍走 _2/_3 后缀）。"""
     base = _UNIT_RE.sub("", name)
     base = base.lower()
     base = _INVALID_ID_CHARS.sub("_", base)
     base = _ID_UNDERSCORE_RUN.sub("_", base)
-    base = base.strip("_")
+    base = base.strip("_") or "col"
     candidate = base
     n = 2
     while candidate in used:

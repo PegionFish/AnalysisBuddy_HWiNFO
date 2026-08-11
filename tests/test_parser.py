@@ -116,6 +116,12 @@ def test_normalize_duplicate_gets_suffix():
     assert normalize_metric_id("A [V]", used) == "a_3"
 
 
+def test_normalize_non_ascii_falls_back_to_col():
+    used: set = set()
+    assert normalize_metric_id("温度 [°C]", used) == "col"
+    assert normalize_metric_id("电流 [A]", used) == "col_2"
+
+
 # ---------- classify_columns ----------
 
 def test_classify_date_time_always_drop():
