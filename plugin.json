@@ -2,7 +2,142 @@
   "id": "hwinfo-log",
   "display_name": "HWiNFO 硬件监控日志解析器",
   "version": "0.1.0",
+  "author": "PegionFish",
+  "repository": "https://github.com/PegionFish/AnalysisBuddy_HWiNFO",
+  "update_url": "https://github.com/PegionFish/AnalysisBuddy_HWiNFO",
+  "tools": ["AnalysisBuddy >= 0.1.0"],
+  "changelog": [
+    {
+      "version": "0.1.0",
+      "date": "2026-08-15",
+      "notes": [
+        "首个可用版本：HWiNFO64 CSV 日志解析（动态 schema，523 列自适应）",
+        "load 只做 O(表头+样本) 预扫描（尾部采样估时间范围），精确统计推迟到 parse 期"
+      ]
+    }
+  ],
   "entry": { "command": "python", "args": ["main.py"] },
-  "match": { "extensions": ["csv"], "header_fingerprints": ["Date,Time,"] },
-  "min_protocol_version": 1
+  "match": {
+    "extensions": ["csv"],
+    "header_fingerprints": ["Date,Time,", "Date\",\"Time"]
+  },
+  "min_protocol_version": 1,
+  "presets": [
+    {
+      "id": "cpu-temp-monitor",
+      "name": { "zh": "核心温度监控", "en": "CPU Temperature Monitor" },
+      "description": {
+        "zh": "动态 schema 样板：语义槽 want + 宽候选族（规范化 id 与原始表头双通道），首个命中吸收跨平台列名差异",
+        "en": "Dynamic-schema template: semantic want slots with wide candidate families (normalized ids and raw header strings); first hit absorbs cross-platform column name variance"
+      },
+      "entries": [
+        {
+          "want": "cpu_temp",
+          "names": [
+            "cpu_package_temperature",
+            "cpu_temperature",
+            "cpu_ia_cores",
+            "core_temperatures_avg",
+            "CPU Package [°C]",
+            "CPU IA Cores [°C]",
+            "Core Temperatures (avg) [°C]",
+            "temperature",
+            "temp"
+          ]
+        },
+        {
+          "want": "cpu_clock",
+          "names": [
+            "cpu_clock",
+            "cpu_clock_2",
+            "p_core_0_clock",
+            "core_clocks_avg",
+            "P-core 0 Clock [MHz]",
+            "Core Clocks (avg) [MHz]",
+            "clock",
+            "core clock"
+          ]
+        }
+      ],
+      "groups": [
+        {
+          "id": "memory-storage",
+          "name": { "zh": "内存/存储", "en": "Memory & Storage" },
+          "entries": [
+            {
+              "want": "memory_used",
+              "names": [
+                "physical_memory_used",
+                "virtual_memory_committed",
+                "Physical Memory Used [MB]",
+                "Virtual Memory Committed [MB]",
+                "memory",
+                "ram"
+              ]
+            },
+            {
+              "want": "disk_load",
+              "names": [
+                "disk_total_activity",
+                "total_activity",
+                "Disk Total Activity [%]",
+                "Total Activity [%]",
+                "activity"
+              ]
+            }
+          ]
+        }
+      ],
+      "keywords": ["temperature", "temp", "clock"]
+    },
+    {
+      "id": "gpu-monitor",
+      "name": { "zh": "GPU 监控", "en": "GPU Monitor" },
+      "description": {
+        "zh": "跨设备重名列（两条 GPU Clock [MHz]）以 _2 后缀候选 + 宽候选族吸收；keywords 作整预设失配的最后防线",
+        "en": "Duplicate cross-device columns (two 'GPU Clock [MHz]') absorbed via _2-suffix candidates and wide families; keywords are the last-resort fallback for full preset mismatch"
+      },
+      "entries": [
+        {
+          "want": "gpu_clock",
+          "names": [
+            "gpu_clock",
+            "gpu_clock_2",
+            "gpu_memory_clock",
+            "gpu_video_clock",
+            "gpu effective clock",
+            "GPU Clock [MHz]",
+            "GPU Memory Clock [MHz]",
+            "GPU Video Clock [MHz]",
+            "clock"
+          ]
+        },
+        {
+          "want": "gpu_temp",
+          "names": [
+            "gpu_temperature",
+            "gpu_core_temperature",
+            "gpu_memory_junction_temperature",
+            "GPU Temperature [°C]",
+            "GPU Core Temperature [°C]",
+            "GPU Memory Junction Temperature [°C]",
+            "temperature",
+            "temp"
+          ]
+        },
+        {
+          "want": "gpu_load",
+          "names": [
+            "gpu_core_load",
+            "gpu_memory_controller_load",
+            "GPU Core Load [%]",
+            "GPU Memory Controller Load [%]",
+            "load",
+            "usage"
+          ]
+        }
+      ],
+      "keywords": ["gpu", "video", "vram"]
+    }
+  ]
 }

@@ -4,6 +4,10 @@
 # 契约（sdk-plugins.md §1.2/§1.4），使 hwinfo-log 测试可独立运行；正式 SDK 已安装
 # （pip install -e sdk/python）时本文件不生效，测试走真实 SDK（真 dogfood）。
 # 签名与正式 SDK 对齐：EmitContext(file_id, sender, batch_size=4000, ...)。
+# 2026-08-15 漂移修复（对齐 sdk/python/analysisbuddy/plugin.py L134-155）：
+#   - EmitContext 补 records_so_far 只读属性（context.py L104-107）；
+#   - on_parse 默认抛 UnsupportedInV1Error（-32005），不再 return 0；
+#   - on_annotate 默认抛 UnsupportedInV1Error。
 
 import sys
 import types
@@ -23,6 +27,11 @@ class EmitContext:
         self._seq = 0
         self._records_so_far = 0
         self._cancelled = False
+
+    @property
+    def records_so_far(self) -> int:
+        """只读属性（对齐正式 SDK context.py L104-107）：累计已发记录数。"""
+        return self._records_so_far
 
     def emit_records(self, records: typing.List[dict]) -> None:
         for record in records:
@@ -81,6 +90,14 @@ class InvalidParamsError(AnalysisBuddyError):
     pass
 
 
+class UnsupportedInV1Error(AnalysisBuddyError):
+    """对齐正式 SDK errors.py L75-80：未实现/未支持 → -32005 unsupported_in_v1。"""
+
+    def __init__(self, message: str = "unsupported in v1", data: typing.Any = None) -> None:
+        super().__init__(message, data)
+        self.code = -32005
+
+
 class AnalysisBuddyPlugin:
     """公共 API 契约镜像（sdk-plugins.md §1.2）。子类覆写 on_* 方法。"""
 
@@ -121,7 +138,9 @@ class AnalysisBuddyPlugin:
         return {}
 
     def on_parse(self, file_id: str, options: typing.Optional[dict], ctx: EmitContext) -> int:
-        return 0
+        """默认占位实现：未覆写时抛 UnsupportedInV1Error → -32005（对齐正式 SDK）。"""
+        raise UnsupportedInV1Error("parse not implemented by this plugin",
+                                   data={"file_id": file_id})
 
     def on_schema(self) -> dict:
         return {"metrics": []}
@@ -130,7 +149,8 @@ class AnalysisBuddyPlugin:
         return {"entries": []}
 
     def on_annotate(self, file_id: str, range: dict) -> dict:
-        return {"events": []}
+        """默认占位实现：未覆写时抛 UnsupportedInV1Error → -32005（对齐正式 SDK）。"""
+        raise UnsupportedInV1Error("annotate is not supported by this plugin")
 
     def on_unload_file(self, file_id: str) -> None:
         return None
@@ -149,6 +169,7 @@ def _install_stub() -> None:
     module.ParseFailedError = ParseFailedError
     module.CancelledError = CancelledError
     module.InvalidParamsError = InvalidParamsError
+    module.UnsupportedInV1Error = UnsupportedInV1Error
     sys.modules["analysisbuddy"] = module
 
 

@@ -1,0 +1,28 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  pack-and-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 打包发布 zip + SHA256SUMS（含 tag/version 一致性自检）
+        shell: powershell
+        run: ./scripts/pack.ps1
+        env:
+          AB_RELEASE_TAG: ${{ github.ref_name }}
+
+      - name: 上传 Release 资产（唯一 zip + 校验和文件）
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/AnalysisBuddy_hwinfo-log_v*.zip
+            dist/SHA256SUMS.txt

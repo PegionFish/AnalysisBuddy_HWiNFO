@@ -6,10 +6,14 @@
 #   python main.py                  # 宿主以 plugin.json entry 拉起
 #
 # 能力（§5）：on_can_handle 打分（0.6 基础 + 0.2 单位后缀 + 0.1 指纹，封顶 1.0）；
-# on_load_file 冻结 schema + 全文件统计（row_count/bad_lines/first_ts/last_ts）；
+# on_load_file 只做 O(表头+样本) 预扫描（§7.2 P0 纪律）：冻结 schema、first_ts 取
+# 样本首行、last_ts 取尾部采样末行、row_count 按样本平均行字节估算（GB 级不击穿
+# 10s 预算；精确统计推迟到 parse 期，bad_lines 由 parse 回填）；
 # on_schema 全部已 load 文件列集合并集去重；on_parse 逐行产出 Record（每 500 条
-# 附 raw_line、2 万行心跳）；on_key_values 恒空；不覆写 on_annotate。
+# 附 raw_line、2 万行心跳按字节进度估算 percent）；on_key_values 恒空；
+# 不覆写 on_annotate。
 
+import io
 import json
 import os
 from typing import Dict, List, Optional
@@ -42,8 +46,8 @@ class HwInfoLogPlugin(AnalysisBuddyPlugin):
     def __init__(self) -> None:
         super().__init__()
         # file_id -> {"path", "schema": HwInfoSchema, "config": dict,
-        #             "row_count": int, "bad_lines": int,
-        #             "first_ts": Optional[int], "last_ts": Optional[int]}
+        #             "row_count": int(估算), "bad_lines": int(parse 后回填),
+        #             "first_ts": Optional[int](样本首行), "last_ts": Optional[int](尾部采样)}
         self._files: Dict[str, Dict] = {}
 
     # ---- 生命周期 ------------------------------------------------------
@@ -62,8 +66,11 @@ class HwInfoLogPlugin(AnalysisBuddyPlugin):
         if score and "date,time," in head.lower():
             score += 0.1
         score = min(score, 1.0)
-        reason = f"hwinfo csv: {len(cells)} columns, unit suffix detected" if score else None
-        return {"can_handle": score > 0.0, "confidence": score, "reason": reason}
+        result = {"can_handle": score > 0.0, "confidence": score}
+        if score:
+            # skip-if-empty 约定（§1.0）：reason 无值即省略键，不输出 null。
+            result["reason"] = f"hwinfo csv: {len(cells)} columns, unit suffix detected"
+        return result
 
     def on_load_file(self, p: dict) -> dict:
         path = p["path"]
@@ -89,39 +96,35 @@ class HwInfoLogPlugin(AnalysisBuddyPlugin):
             date_format = detect_date_format(sample_cells[0][0]) if sample_cells else "d.m.y"
         cfg["date_format_resolved"] = date_format
 
-        row_count = 0
-        bad_lines = 0
+        # 预扫描纪律（§7.2 P0）：不整文件计行 —— first_ts 取样本首行，
+        # last_ts 取尾部采样末行，row_count 按字节/平均行字节估算（GB 级安全）。
         first_ts: Optional[int] = None
-        last_ts: Optional[int] = None
-        with open(path, "r", encoding=enc, errors="replace") as f:
-            next(f, None)  # 跳过表头
-            for raw in f:
-                cells = split_csv_line(raw)
-                if len(cells) != len(schema.columns):
-                    bad_lines += 1
-                    continue
-                ts_ms = parse_timestamp(cells[0], cells[1], date_format)
-                if ts_ms is None:
-                    bad_lines += 1
-                    continue
-                row_count += 1
-                if first_ts is None:
-                    first_ts = ts_ms
-                last_ts = ts_ms
+        if sample_cells:
+            first_ts = parse_timestamp(sample_cells[0][0], sample_cells[0][1], date_format)
+        last_ts = self._tail_last_ts(path, enc, date_format)
+
+        file_bytes = os.path.getsize(path)
+        if sample_cells:
+            avg_bytes = (sum(len(t.encode(enc)) for t in sample_texts if t.strip())
+                         / len(sample_cells))
+        else:
+            avg_bytes = 0.0
+        row_count = int(file_bytes / avg_bytes) if avg_bytes > 0 else 0
 
         self._files[p["file_id"]] = {
             "path": path,
             "schema": schema,
             "config": cfg,
             "row_count": row_count,
-            "bad_lines": bad_lines,
+            "bad_lines": 0,  # 精确统计推迟到 parse 期，结束后回填
             "first_ts": first_ts,
             "last_ts": last_ts,
         }
         summary = {"record_count_hint": row_count}
-        if first_ts is not None:
+        if first_ts is not None and last_ts is not None:
             summary["time_range"] = {"start_ms": first_ts, "end_ms": last_ts}
-        summary["note"] = f"hwinfo-log: {len(schema.columns)} columns, {bad_lines} bad lines skipped"
+        summary["note"] = (f"hwinfo-log: {len(schema.columns)} columns, "
+                           "record_count_hint is an estimate (head/tail sampled)")
         return summary
 
     def on_schema(self) -> dict:
@@ -148,12 +151,13 @@ class HwInfoLogPlugin(AnalysisBuddyPlugin):
         bad = 0
         line_no = 0
         file_bytes = os.path.getsize(path)
-        with open(path, "r", encoding=_decode_name(cfg), errors="replace") as f:
+        with open(path, "rb") as raw:
+            f = io.TextIOWrapper(raw, encoding=_decode_name(cfg), errors="replace")
             next(f, None)  # 跳过表头
-            for raw in f:
+            for line in f:
                 ctx.check_cancelled()
                 line_no += 1
-                cells = split_csv_line(raw)
+                cells = split_csv_line(line)
                 if len(cells) != len(schema.columns):
                     bad += 1
                     continue
@@ -167,12 +171,15 @@ class HwInfoLogPlugin(AnalysisBuddyPlugin):
                     continue
                 if total % 500 == 0:
                     for r in records:
-                        r["raw_line"] = raw.rstrip("\n")
+                        r["raw_line"] = line.rstrip("\n")
                 ctx.emit_records(records)
                 total += len(records)
                 if line_no % 20000 == 0:
-                    ctx.progress(percent=min(100.0, 100.0 * line_no / (data["row_count"] or 1)),
-                                 bytes_read=None)
+                    # 文件大小无关的字节进度估算（§7.2 P0：不依赖 load 期全量统计）
+                    percent = 100.0 if not file_bytes else min(
+                        100.0, 100.0 * raw.tell() / file_bytes)
+                    ctx.progress(percent=percent, bytes_read=None)
+        data["bad_lines"] = bad
         if bad:
             self.log("WARN", f"{path}: skipped {bad} bad line(s)")
         ctx.progress(percent=100.0, bytes_read=file_bytes)
@@ -213,6 +220,33 @@ class HwInfoLogPlugin(AnalysisBuddyPlugin):
             header_text = f.readline()
             sample_texts = [f.readline() for _ in range(1000)]
         return header_text, sample_texts
+
+    @staticmethod
+    def _read_tail(path: str, enc: str, tail_bytes: int = 4096,
+                   n_lines: int = 5) -> List[str]:
+        """读文件尾部 tail_bytes 字节 → 拆行 → 末 n_lines 行（去空行）。
+        seek 起点 clamp ≥0；丢弃块内首行（可能被截断），用已解析编码解码，
+        尾部字节不完整时 errors=replace 兜底。"""
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - tail_bytes))
+            raw = f.read()
+        parts = raw.decode(enc, errors="replace").split("\n", 1)
+        body = parts[1] if len(parts) > 1 else parts[0]
+        lines = [l for l in body.split("\n") if l.strip()]
+        return lines[-n_lines:]
+
+    @staticmethod
+    def _tail_last_ts(path: str, enc: str, date_format: str) -> Optional[int]:
+        """尾部采样末行时间戳；末 n_lines 行都解析失败 → None（坏尾兜底）。"""
+        for line in reversed(HwInfoLogPlugin._read_tail(path, enc)):
+            cells = split_csv_line(line)
+            if len(cells) < 2:
+                continue
+            ts_ms = parse_timestamp(cells[0], cells[1], date_format)
+            if ts_ms is not None:
+                return ts_ms
+        return None
 
     @staticmethod
     def _needs_gbk_fallback(header_text: str, sample_texts: List[str]) -> bool:

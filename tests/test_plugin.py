@@ -50,7 +50,9 @@ def _load(plugin, path, file_id="f1"):
 def test_can_handle_abstain_when_ext_not_csv():
     plugin = HwInfoLogPlugin()
     r = plugin.on_can_handle({"ext": "log", "head_sample": 'Date,Time,"CPU Usage [%]"'})
-    assert r == {"can_handle": False, "confidence": 0.0, "reason": None}
+    # skip-if-empty 约定（§1.0）：reason 无值即省略键，不输出 null。
+    assert r == {"can_handle": False, "confidence": 0.0}
+    assert "reason" not in r
 
 
 def test_can_handle_060_basic_hwinfo_signature():
@@ -96,16 +98,18 @@ def test_can_handle_confidence_capped_at_one(monkeypatch):
 def test_load_sample_schema_frozen_hint_range_note():
     plugin = HwInfoLogPlugin()
     summary = _load(plugin, FIXTURES / "hwinfo_sample.csv")
-    assert summary["record_count_hint"] == 24
+    # record_count_hint 为字节估算（int(文件字节 / 样本平均行字节)），非精确值
+    assert summary["record_count_hint"] == 30
     tr = summary["time_range"]
     assert 1_000_000_000_000 < tr["start_ms"] < 2_000_000_000_000
     assert tr["start_ms"] <= tr["end_ms"]
-    assert summary["note"] == "hwinfo-log: 523 columns, 0 bad lines skipped"
+    assert summary["note"] == (
+        "hwinfo-log: 523 columns, record_count_hint is an estimate (head/tail sampled)")
 
     data = plugin._files["f1"]
     assert data["path"] == str(FIXTURES / "hwinfo_sample.csv")
-    assert data["row_count"] == 24
-    assert data["bad_lines"] == 0
+    assert data["row_count"] == 30  # 估算（真实 24 行；精确统计在 parse 期）
+    assert data["bad_lines"] == 0  # load 期不再计坏行，parse 结束后回填
     assert 1_000_000_000_000 < data["first_ts"] < 2_000_000_000_000
     assert data["last_ts"] >= data["first_ts"]
     assert len(data["schema"].columns) == 523
@@ -115,14 +119,18 @@ def test_load_sample_schema_frozen_hint_range_note():
     assert data["config"]["date_format_resolved"] == "d.m.y"
 
 
-def test_load_malformed_counts_bad_lines():
+def test_load_malformed_estimate_and_bad_lines_deferred():
     plugin = HwInfoLogPlugin()
     summary = _load(plugin, FIXTURES / "hwinfo_malformed.csv")
     data = plugin._files["f1"]
-    assert data["row_count"] == 5
-    assert data["bad_lines"] == 3
-    assert summary["record_count_hint"] == 5
-    assert summary["note"] == "hwinfo-log: 6 columns, 3 bad lines skipped"
+    assert data["row_count"] == 10  # 字节估算（真实 8 行：5 好 + 3 坏）
+    assert data["bad_lines"] == 0  # 坏行统计推迟到 parse 期
+    assert summary["record_count_hint"] == 10
+    assert summary["note"] == (
+        "hwinfo-log: 6 columns, record_count_hint is an estimate (head/tail sampled)")
+    # 时间范围仍由样本首行 + 尾部采样给出
+    assert summary["time_range"]["start_ms"] == data["first_ts"]
+    assert summary["time_range"]["end_ms"] == data["last_ts"]
 
 
 def test_load_missing_file_raises_file_load_failed():
@@ -137,9 +145,9 @@ def test_load_gbk_auto_fallback_to_gbk():
     summary = _load(plugin, FIXTURES / "hwinfo_gbk.csv")
     data = plugin._files["f1"]
     assert data["config"]["_encoding_resolved"] == "gbk"
-    assert data["row_count"] == 3
+    assert data["row_count"] == 4  # 字节估算（真实 3 行）
     assert data["bad_lines"] == 0
-    assert summary["record_count_hint"] == 3
+    assert summary["record_count_hint"] == 4
     assert data["schema"].columns[3].name == "温度 [°C]"
 
 
@@ -159,7 +167,7 @@ def test_load_explicit_date_format_mdy(tmp_path, monkeypatch):
     _load(plugin, csv_file)
     data = plugin._files["f1"]
     assert data["config"]["date_format_resolved"] == "m.d.y"
-    assert data["row_count"] == 2
+    assert data["row_count"] == 2  # 字节估算恰好等于真实行数
     assert data["bad_lines"] == 0
     assert data["first_ts"] < data["last_ts"]
 
@@ -255,6 +263,7 @@ def test_parse_malformed_skips_bad_lines(capsys):
     total = plugin.on_parse("f1", None, ctx)
     assert total == 5 * numeric
     assert "skipped 3 bad line(s)" in capsys.readouterr().err
+    assert plugin._files["f1"]["bad_lines"] == 3  # load 期挂账，parse 结束后回填
 
 
 def test_parse_raw_line_sampling_every_500(tmp_path):
@@ -286,6 +295,69 @@ def test_parse_cancelled_raises_cancelled_error():
     ctx.cancel()
     with pytest.raises(CancelledError):
         plugin.on_parse("f1", None, ctx)
+
+
+# ---------- load 预扫描：尾部采样 / 字节估算 / 字节进度（§7.2 P0） ----------
+
+def test_load_tail_sampling_last_ts_from_file_end(tmp_path):
+    """末行超出 1000 行样本窗与 4096 字节头部时，last_ts 仍取真实末行（尾部采样）。"""
+    from parser import parse_timestamp
+
+    rows = 3000
+    csv_file = tmp_path / "tail.csv"
+    lines = ['Date,Time,"A [W]"']
+    for i in range(rows):
+        m, s = divmod(i, 60)
+        lines.append("6.8.2026,10:{0:02d}:{1:02d}.1,1.5".format(m, s))
+    csv_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    plugin = HwInfoLogPlugin()
+    summary = _load(plugin, csv_file)
+    data = plugin._files["f1"]
+    first_ts = parse_timestamp("6.8.2026", "10:00:00.1", "d.m.y")
+    last_ts = parse_timestamp("6.8.2026", "10:49:59.1", "d.m.y")
+    assert data["first_ts"] == first_ts  # 样本首行
+    assert data["last_ts"] == last_ts  # 尾部采样末行（≠ 样本窗末行 10:16:39）
+    assert summary["time_range"] == {"start_ms": first_ts, "end_ms": last_ts}
+
+
+def test_load_record_count_hint_is_byte_estimate(tmp_path):
+    """hint = int(文件字节 / 样本平均行字节)，与真实行数同量级（估算语义）。"""
+    rows = 1000
+    line = "6.8.2026,10:00:1.752,1.5\n"
+    csv_file = tmp_path / "estimate.csv"
+    # 二进制写入：规避 Windows 文本模式 \n → \r\n 的换行翻译，保证字节数可预期
+    csv_file.write_bytes(('Date,Time,"A [W]"\n' + line * rows).encode("utf-8"))
+
+    plugin = HwInfoLogPlugin()
+    summary = _load(plugin, csv_file)
+    size = os.path.getsize(str(csv_file))
+    avg = len(line.encode("utf-8"))
+    expected = int(size / avg)
+    assert summary["record_count_hint"] == expected
+    assert "estimate" in summary["note"]
+    assert plugin._files["f1"]["row_count"] == expected
+    assert abs(expected - rows) <= 2  # 头部一行不影响量级
+
+
+def test_parse_heartbeat_percent_by_bytes(tmp_path):
+    """2 万行心跳 percent 按字节进度估算：前半短行（小字节）处心跳远小于 50%，
+    而按行数估算会恰好 50% —— 区分字节进度与行数进度的语义。"""
+    short = "6.8.2026,10:00:0.1,1.5\n"
+    long = "6.8.2026,10:00:0.1,1.5000000000000000000000000000000000001\n"
+    csv_file = tmp_path / "bytes_progress.csv"
+    csv_file.write_text('Date,Time,"A [W]"\n' + short * 20000 + long * 20000,
+                        encoding="utf-8")
+
+    plugin = HwInfoLogPlugin()
+    _load(plugin, csv_file)
+    ctx = RecordingContext()
+    total = plugin.on_parse("f1", None, ctx)
+    assert total == 40000
+
+    mid = [c for c in ctx.progress_calls if c["percent"] is not None]
+    assert any(20.0 < c["percent"] < 45.0 for c in mid)  # 字节进度 ≈33%，行数进度=50%
+    assert ctx.progress_calls[-1]["percent"] == 100.0
 
 
 # ---------- on_key_values / on_unload_file（§5.6，DoD） ----------
