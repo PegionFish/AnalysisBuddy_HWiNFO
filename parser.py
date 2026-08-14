@@ -115,14 +115,15 @@ def normalize_metric_id(name: str, used: set) -> str:
 
 
 def _is_bool_cell(raw: str) -> bool:
-    return raw.strip().lower() in {"yes", "no"}
+    return raw.strip().lower() in {"yes", "no", "是", "否"}
 
 
 def classify_columns(header: List[str], sample_cells: List[List[str]],
                      include_bool: bool) -> HwInfoSchema:
     """前 1000 行样本判定列类型（spec 2.5）：
     - 数值列：样本中出现 ≥1 个可 float() 的值 → kind "numeric"
-    - 布尔列：样本值全部 ∈ {Yes,No}（大小写不敏感）→ kind "bool"
+    - 布尔列：样本值全部 ∈ {Yes,No,是,否}（大小写不敏感；中文"是/否"来自
+      HWiNFO 中文版 [Yes/No] 值区的 GBK 字节，经行级双解码恢复）→ kind "bool"
     - 其余 → kind "drop"
     include_bool=True 时布尔列并入 numeric（产出 1/0 值，spec 2.7）。
     Date/Time 两列（index 0/1）恒为 "drop"，不产出指标。"""
@@ -157,8 +158,9 @@ def _is_float(raw: str) -> bool:
 def parse_row(cells: List[str], schema: HwInfoSchema, ts_ms: int,
               include_bool: bool) -> List[Dict]:
     """一行数据 → Record 列表（每数值列一条：{"timestamp","metric","value"}）。
-    值解析失败（非数值文本且非 Yes/No）跳过该列并计数（调用方累计 bad 计数）。
-    include_bool=True 时布尔列产出 {"timestamp","metric","value": 1|0}。"""
+    值解析失败（非数值文本且非 Yes/No/是/否）跳过该列并计数（调用方累计 bad 计数）。
+    include_bool=True 时布尔列产出 {"timestamp","metric","value": 1|0}（中文
+    "是/否"与英文 Yes/No 同逻辑）。"""
     records: List[Dict] = []
     for col in schema.columns:
         if col.kind == "drop":
@@ -168,9 +170,9 @@ def parse_row(cells: List[str], schema: HwInfoSchema, ts_ms: int,
         raw = cells[col.index].strip()
         if col.kind == "bool":
             lower = raw.lower()
-            if lower == "yes":
+            if lower in ("yes", "是"):
                 records.append({"timestamp": ts_ms, "metric": col.metric_id, "value": 1})
-            elif lower == "no":
+            elif lower in ("no", "否"):
                 records.append({"timestamp": ts_ms, "metric": col.metric_id, "value": 0})
             continue
         try:

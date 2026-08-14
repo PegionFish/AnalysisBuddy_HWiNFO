@@ -9,7 +9,7 @@ import pytest
 
 from analysisbuddy import CancelledError, EmitContext, FileLoadFailedError
 
-from main import HwInfoLogPlugin
+from main import HwInfoLogPlugin, decode_data_line
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -91,6 +91,57 @@ def test_can_handle_confidence_capped_at_one(monkeypatch):
     assert (0.9, 1.0) in seen
     assert r["confidence"] == 0.9
     assert r["confidence"] <= 1.0
+
+
+def test_can_handle_bom_truncated_head_claims():
+    """真实中文版 head_sample = 前 4096 字节（UTF-8 BOM + 截断的超长表头，无换行符，
+    cells[0] 带 \ufeff）→ 前缀判据认领（剥 BOM 后以 Date,Time, 开头）。"""
+    plugin = HwInfoLogPlugin()
+    head = "\ufeffDate,Time,\"提交虚拟内存 [MB]\",\"可用虚拟内存 [MB]\"," + "x" * 4500
+    r = plugin.on_can_handle({"ext": "csv", "head_sample": head[:4096]})
+    assert r["can_handle"] is True
+    assert r["confidence"] == 0.9  # 0.6 前缀 + 0.2 单位后缀 + 0.1 指纹子串
+    assert "reason" in r
+
+
+def test_can_handle_bom_full_header_line():
+    """BOM + 完整首行（中文列名）→ 前缀判据认领。"""
+    plugin = HwInfoLogPlugin()
+    head = "\ufeff" + 'Date,Time,"CPU 温度 [℃]",核心过热降频 [Yes/No]'
+    r = plugin.on_can_handle({"ext": "csv", "head_sample": head})
+    assert r["can_handle"] is True
+    assert r["confidence"] == 0.9
+
+
+# ---------- decode_data_line（行级双解码，§5.3 混合编码文件） ----------
+
+def test_decode_data_line_utf8_primary_falls_back_to_gbk():
+    """主编码 utf-8、值区为 GBK 字节（是=0xCA 0xC7）→ 整行 gbk 重解码恢复中文。"""
+    raw = ("15.7.2025,17:40:11.073,92.0,".encode("ascii")
+           + "是".encode("gbk") + b"," + "是".encode("gbk") + ",85.0".encode("ascii"))
+    expected = "15.7.2025,17:40:11.073,92.0,是,是,85.0"
+    assert decode_data_line(raw, "utf-8") == expected
+    assert decode_data_line(raw, "utf-8-sig") == expected  # utf-8-sig 系同样走 gbk 兜底
+
+
+def test_decode_data_line_utf8_primary_pure_utf8_unchanged():
+    raw = "15.7.2025,17:40:11.073,92.0,85.0".encode("utf-8")
+    assert decode_data_line(raw, "utf-8") == "15.7.2025,17:40:11.073,92.0,85.0"
+
+
+def test_decode_data_line_gbk_primary_direct():
+    raw = "温度 [°C]".encode("gbk")
+    assert decode_data_line(raw, "gbk") == "温度 [°C]"
+
+
+def test_decode_data_line_utf8_sig_strips_bom():
+    raw = b"\xef\xbb\xbf" + 'Date,Time,"CPU 温度 [℃]"'.encode("utf-8")
+    assert decode_data_line(raw, "utf-8-sig") == 'Date,Time,"CPU 温度 [℃]"'
+
+
+def test_decode_data_line_utf16_primary_direct():
+    raw = "15.7.2025".encode("utf-16")
+    assert decode_data_line(raw, "utf-16") == "15.7.2025"
 
 
 # ---------- on_load_file（§5.3，DoD） ----------
@@ -375,3 +426,63 @@ def test_unload_file_pops_state_and_schema_resets():
     assert "f1" not in plugin._files
     assert plugin.on_schema() == {"metrics": []}
     plugin.on_unload_file("f1")  # 幂等，不抛错
+
+
+# ---------- 真实中文版特征回归（tests/fixtures/hwinfo_zh_mixed.csv） ----------
+
+def test_read_tail_default_window_covers_long_tail_line():
+    """默认 64KB 尾部窗口在超长"传感器名"汇总行（33KB、600+ 逗号）存在时仍能
+    取到数据行（4096 字节窗口会被该行整个吃掉 → last_ts=None）。"""
+    lines = HwInfoLogPlugin._read_tail(str(FIXTURES / "hwinfo_zh_mixed.csv"), "utf-8-sig")
+    assert lines[-1].startswith("top,")  # 传感器汇总行仍在窗口内
+    assert any(l.startswith("15.7.2025") for l in lines)  # 窗口内含数据行
+
+
+def test_load_zh_mixed_bom_gbk_bools_and_time_range():
+    """BOM + 中文表头 + GBK [Yes/No] 值区 + 点分隔日期 + 超长尾部传感器行：
+    schema 列数与表头一致、布尔列分类正确、time_range 不因尾部行缺失。"""
+    from parser import parse_timestamp
+
+    plugin = HwInfoLogPlugin()
+    summary = _load(plugin, FIXTURES / "hwinfo_zh_mixed.csv")
+    data = plugin._files["f1"]
+    assert data["config"]["_encoding_resolved"] == "utf-8-sig"  # BOM 文件，非整文件 gbk
+    schema = data["schema"]
+    assert [c.kind for c in schema.columns] == [
+        "drop", "drop", "numeric", "bool", "bool", "numeric"]
+    assert len(schema.numeric) == 2  # include_bool 默认 false，布尔列不并入
+    first = parse_timestamp("15.7.2025", "17:40:11.073", "d.m.y")
+    last = parse_timestamp("15.7.2025", "17:40:13.081", "d.m.y")
+    assert data["first_ts"] == first
+    assert data["last_ts"] == last  # 超长尾部传感器行不阻塞尾部采样
+    assert summary["time_range"] == {"start_ms": first, "end_ms": last}
+
+
+def test_parse_zh_mixed_include_bool_chinese_ones_and_zeros(tmp_path, monkeypatch):
+    cfg = tmp_path / "config.json"
+    cfg.write_text('{"date_format": "auto", "encoding": "auto",'
+                   ' "include_bool_columns": true}', encoding="utf-8")
+    monkeypatch.setattr("main.CONFIG_PATH", str(cfg))
+    plugin = HwInfoLogPlugin()
+    _load(plugin, FIXTURES / "hwinfo_zh_mixed.csv")
+    assert len(plugin._files["f1"]["schema"].numeric) == 4  # 2 数值 + 2 布尔并入
+    ctx = RecordingContext()
+    total = plugin.on_parse("f1", None, ctx)
+    assert total == 12  # 3 行 × 4 指标列
+    by_metric: dict = {}
+    for r in ctx.records:
+        by_metric.setdefault(r["metric"], []).append(r["value"])
+    bool_seqs = [tuple(vs) for vs in by_metric.values() if all(v in (0, 1) for v in vs)]
+    assert sorted(bool_seqs) == [(1, 0, 1), (1, 1, 0)]  # 是→1 / 否→0 逐行映射
+    assert len({r["timestamp"] for r in ctx.records}) == 3
+
+
+def test_parse_zh_mixed_default_drops_bool_no_extra_bad_lines(capsys):
+    plugin = HwInfoLogPlugin()
+    _load(plugin, FIXTURES / "hwinfo_zh_mixed.csv")
+    ctx = RecordingContext()
+    total = plugin.on_parse("f1", None, ctx)
+    assert total == 6  # 3 行 × 2 数值列；布尔列默认丢弃（设计行为）
+    assert plugin._files["f1"]["bad_lines"] == 1  # 仅超长传感器汇总行，GBK 值行不坏
+    assert "skipped 1 bad line(s)" in capsys.readouterr().err
+    assert all(r["value"] in (85.0, 85.5, 86.0, 91.0, 92.0, 93.5) for r in ctx.records)

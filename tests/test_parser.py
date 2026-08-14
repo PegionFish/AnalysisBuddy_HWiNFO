@@ -155,6 +155,16 @@ def test_classify_bool_case_insensitive():
     assert schema.columns[2].kind == "bool"
 
 
+def test_classify_chinese_bool_values():
+    """中文版 [Yes/No] 列值区为 GBK 的"是/否"（经行级双解码恢复）→ kind "bool"。"""
+    header = ["Date", "Time", "核心过热降频 [Yes/No]", "A [W]"]
+    sample = [["15.7.2025", "17:40:11.073", "是", "1.5"],
+              ["15.7.2025", "17:40:12.078", "否", "2.5"]]
+    schema = classify_columns(header, sample, include_bool=False)
+    assert schema.columns[2].kind == "bool"
+    assert schema.columns[3].kind == "numeric"
+
+
 def test_classify_include_bool_merges_into_numeric():
     header = ["Date", "Time", "A [W]", "B [Yes/No]"]
     sample = [["6.8.2026", "15:29:1.752", "1.5", "Yes"]]
@@ -197,6 +207,19 @@ def test_parse_row_bool_ones_and_zeros():
     assert rows == [
         {"timestamp": 1786030141752, "metric": "flag", "value": 0},
         {"timestamp": 1786030141752, "metric": "a", "value": 2.0},
+    ]
+
+
+def test_parse_row_chinese_bool_ones_and_zeros():
+    """中文"是/否"→ 1/0，与 Yes/No 同逻辑。"""
+    header = ["Date", "Time", "过热降频 [Yes/No]", "A [W]"]
+    sample = [["15.7.2025", "17:40:11.073", "是", "1.5"]]
+    schema = _schema(header, sample, include_bool=True)
+    rows = parse_row(["15.7.2025", "17:40:13.081", "否", "2.0"],
+                     schema, 1752601213081, True)
+    assert rows == [
+        {"timestamp": 1752601213081, "metric": "col", "value": 0},
+        {"timestamp": 1752601213081, "metric": "a", "value": 2.0},
     ]
 
 
@@ -279,3 +302,22 @@ def test_fixture_gbk_is_gbk_encoded():
     text = raw.decode("gbk")
     header = parse_header(text.splitlines()[0])
     assert header[3] == "温度 [°C]"
+
+
+def test_fixture_zh_mixed_binary_shape():
+    """hwinfo_zh_mixed.csv 复刻真实中文版特征：UTF-8 BOM 表头 + GBK 值区 + 超长尾部行。"""
+    raw = (FIXTURES / "hwinfo_zh_mixed.csv").read_bytes()
+    assert raw[:3] == b"\xef\xbb\xbf"  # UTF-8 BOM
+    assert b"\xca\xc7" in raw and b"\xb7\xf1" in raw  # GBK 是/否字节（0xCA 0xC7 / 0xB7 0xF1）
+    lines = raw.split(b"\n")
+    assert lines[-1] == b""  # 文件以换行符结尾
+    tail = lines[-2]  # 超长"传感器名"汇总行
+    assert len(tail) > 12000  # 单行 12KB+，吃掉整个 4096 字节尾部窗口
+    assert tail.count(b",") > 500  # 600+ 逗号
+    assert tail.split(b",", 1)[0] == b"top"
+    header_text = raw[3:].split(b"\n", 1)[0].decode("utf-8")  # 表头纯 UTF-8（剥 BOM）
+    assert parse_header(header_text) == [
+        "Date", "Time", "CPU 温度 [℃]", "核心过热降频 [Yes/No]",
+        "P-core 0 过热降频 [Yes/No]", "磁盘温度 [℃]"]
+    for data_line in lines[1:4]:  # 3 行数据：点分隔日期
+        assert data_line.split(b",", 1)[0].decode("utf-8").count(".") == 2

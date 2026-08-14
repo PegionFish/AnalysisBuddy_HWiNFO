@@ -13,7 +13,6 @@
 # 附 raw_line、2 万行心跳按字节进度估算 percent）；on_key_values 恒空；
 # 不覆写 on_annotate。
 
-import io
 import json
 import os
 from typing import Dict, List, Optional
@@ -54,11 +53,17 @@ class HwInfoLogPlugin(AnalysisBuddyPlugin):
 
     def on_can_handle(self, p: dict) -> dict:
         ext = p.get("ext", "")
-        head = p.get("head_sample") or ""
+        # 真实中文版以 UTF-8 BOM 开头，且 head_sample 是前 4096 字节（可能截断在
+        # 超长表头行中间、无换行符）——先剥 BOM 再按前缀判据认领，不依赖切列首格。
+        head = (p.get("head_sample") or "").lstrip("\ufeff")
         first_line = head.split("\n", 1)[0]
         cells = split_csv_line(first_line)
-        is_hwinfo = (ext == "csv" and len(cells) >= 3
-                     and cells[0].strip('"') == "Date" and cells[1].strip('"') == "Time"
+        # 前缀判据（BOM/截断容忍的强信号）：剥 BOM 后以 "Date,Time," 开头（真实
+        # 文件形态）或以 Date","Time 开头（含 "Date","Time",... 全引号表头变体）。
+        prefix_hit = (first_line.startswith("Date,Time,")
+                      or first_line.startswith('Date","Time')
+                      or first_line.startswith('"Date","Time"'))
+        is_hwinfo = (ext == "csv" and prefix_hit
                      and any("[" in c and "]" in c for c in cells))
         score = 0.6 if is_hwinfo else 0.0
         if score and any(c.strip('"').endswith("]") for c in cells):
@@ -81,14 +86,18 @@ class HwInfoLogPlugin(AnalysisBuddyPlugin):
         cfg["_path"] = path
         enc = _decode_name(cfg)
         header_text, sample_texts = self._read_head(path, enc)
-        if (cfg["encoding"] == "auto" and enc == "utf-8"
-                and self._needs_gbk_fallback(header_text, sample_texts)):
+        if (cfg["encoding"] == "auto" and enc in ("utf-8", "utf-8-sig")
+                and self._needs_gbk_fallback(path, enc)):
             enc = "gbk"
             header_text, sample_texts = self._read_head(path, "gbk")
         cfg["_encoding_resolved"] = enc
 
         header = parse_header(header_text)
-        sample_cells = [split_csv_line(t) for t in sample_texts if t.strip()]
+        # 样本行按表头列数过滤：HWiNFO 末尾"传感器名"汇总行列数远超表头，混入
+        # 样本会污染列分类（GBK 双解码后首格为 "top" 而非日期）。
+        non_empty_texts = [t for t in sample_texts if t.strip()]
+        sample_cells = [c for t in non_empty_texts
+                        if len(c := split_csv_line(t)) == len(header)]
         schema = classify_columns(header, sample_cells,
                                   bool(cfg.get("include_bool_columns", False)))
         date_format = cfg.get("date_format", "auto")
@@ -104,9 +113,12 @@ class HwInfoLogPlugin(AnalysisBuddyPlugin):
         last_ts = self._tail_last_ts(path, enc, date_format)
 
         file_bytes = os.path.getsize(path)
-        if sample_cells:
-            avg_bytes = (sum(len(t.encode(enc)) for t in sample_texts if t.strip())
-                         / len(sample_cells))
+        if non_empty_texts:
+            # 回编码用无 BOM 形态：utf-8-sig 重编码会在每行前加 3 字节 BOM，虚增
+            # 平均行字节；行尾归一为单个 \n（对齐文本模式通用换行翻译 \r\n → \n）。
+            re_enc = "utf-8" if enc == "utf-8-sig" else enc
+            avg_bytes = (sum(len((t.rstrip("\r\n") + "\n").encode(re_enc))
+                             for t in non_empty_texts) / len(non_empty_texts))
         else:
             avg_bytes = 0.0
         row_count = int(file_bytes / avg_bytes) if avg_bytes > 0 else 0
@@ -146,17 +158,18 @@ class HwInfoLogPlugin(AnalysisBuddyPlugin):
     def on_parse(self, file_id: str, options, ctx) -> int:
         data = self._files[file_id]
         path, schema, cfg = data["path"], data["schema"], data["config"]
+        enc = _decode_name(cfg)
         include_bool = cfg.get("include_bool_columns", False)
         total = 0
         bad = 0
         line_no = 0
         file_bytes = os.path.getsize(path)
         with open(path, "rb") as raw:
-            f = io.TextIOWrapper(raw, encoding=_decode_name(cfg), errors="replace")
-            next(f, None)  # 跳过表头
-            for line in f:
+            next(raw, None)  # 跳过表头（字节行，循环内行级双解码）
+            for raw_line in raw:
                 ctx.check_cancelled()
                 line_no += 1
+                line = decode_data_line(raw_line, enc)
                 cells = split_csv_line(line)
                 if len(cells) != len(schema.columns):
                     bad += 1
@@ -215,25 +228,27 @@ class HwInfoLogPlugin(AnalysisBuddyPlugin):
 
     @staticmethod
     def _read_head(path: str, enc: str):
-        """读表头 + 前 1000 行样本（classify 用，§5.3 第 4 步）。"""
-        with open(path, "r", encoding=enc, errors="replace") as f:
-            header_text = f.readline()
-            sample_texts = [f.readline() for _ in range(1000)]
+        """读表头 + 前 1000 行样本（classify 用，§5.3 第 4 步）；字节读行 + 行级
+        双解码（表头纯 UTF-8 无替换符，自然走主编码分支）。"""
+        with open(path, "rb") as f:
+            header_text = decode_data_line(f.readline(), enc)
+            sample_texts = [decode_data_line(f.readline(), enc) for _ in range(1000)]
         return header_text, sample_texts
 
     @staticmethod
-    def _read_tail(path: str, enc: str, tail_bytes: int = 4096,
+    def _read_tail(path: str, enc: str, tail_bytes: int = 65536,
                    n_lines: int = 5) -> List[str]:
-        """读文件尾部 tail_bytes 字节 → 拆行 → 末 n_lines 行（去空行）。
-        seek 起点 clamp ≥0；丢弃块内首行（可能被截断），用已解析编码解码，
-        尾部字节不完整时 errors=replace 兜底。"""
+        """读文件尾部 tail_bytes 字节 → 字节块拆行 → 逐行行级双解码 → 末 n_lines 行
+        （去空行）。seek 起点 clamp ≥0；丢弃块内首行（可能被截断）。
+        默认 64KB：真实中文版末尾有超长"传感器名"汇总行（单行 12KB+、600+ 逗号），
+        4096 字节窗口会被它整个吃掉导致 last_ts=None；64KB 保证窗口内仍有数据行。"""
         size = os.path.getsize(path)
         with open(path, "rb") as f:
             f.seek(max(0, size - tail_bytes))
             raw = f.read()
-        parts = raw.decode(enc, errors="replace").split("\n", 1)
-        body = parts[1] if len(parts) > 1 else parts[0]
-        lines = [l for l in body.split("\n") if l.strip()]
+        parts = raw.split(b"\n", 1)
+        body = parts[1] if len(parts) > 1 else b""
+        lines = [decode_data_line(l, enc) for l in body.split(b"\n") if l.strip()]
         return lines[-n_lines:]
 
     @staticmethod
@@ -249,15 +264,37 @@ class HwInfoLogPlugin(AnalysisBuddyPlugin):
         return None
 
     @staticmethod
-    def _needs_gbk_fallback(header_text: str, sample_texts: List[str]) -> bool:
-        """表头/首行样本出现 ≥10% 替换符（U+FFFD）→ 重开 gbk（§5.3 第 3 步）。"""
-        candidates = [header_text]
-        if sample_texts:
-            candidates.append(sample_texts[0])
+    def _needs_gbk_fallback(path: str, enc: str) -> bool:
+        """前两行按主编码（errors=replace）直接解码出现 ≥10% 替换符（U+FFFD）
+        → 整文件重开 gbk（§5.3 第 3 步）。注意必须在行级双解码之前的"主编码原始
+        视角"上判定：否则纯 GBK 文件的 U+FFFD 会被 decode_data_line 的 gbk 重解码
+        隐藏而漏判（混合编码文件首行替换符占比 <10%，自然不触发，仍走 utf-8 系）。"""
+        candidates = []
+        with open(path, "rb") as f:
+            first_line = f.readline()
+            if first_line:
+                candidates.append(first_line.decode(enc, errors="replace"))
+            second_line = f.readline()
+            if second_line:
+                candidates.append(second_line.decode(enc, errors="replace"))
         for line in candidates:
             if line and line.count("\ufffd") / len(line) >= 0.1:
                 return True
         return False
+
+
+def decode_data_line(raw: bytes, primary_enc: str) -> str:
+    """行级双解码（HWiNFO 中文版混合编码文件）：先按主编码 decode(errors="replace")；
+    结果含 U+FFFD 且主编码属 utf-8 系（utf-8/utf-8-sig）时，改用 gbk 重解码整行返回。
+    行级 gbk 重解码不影响切列——GBK 双字节第二字节范围 0x40-0xFE，不含 0x2C 逗号与
+    0x22 引号，逗号/引号边界与原字节流完全一致。主编码为 gbk/utf-16 时直接主编码
+    解码（utf-8-sig 解码会顺带剥掉表头行 BOM）。"""
+    if primary_enc in ("gbk", "utf-16"):
+        return raw.decode(primary_enc, errors="replace")
+    text = raw.decode(primary_enc, errors="replace")
+    if "\ufffd" in text and primary_enc in ("utf-8", "utf-8-sig"):
+        return raw.decode("gbk", errors="replace")
+    return text
 
 
 def _decode_name(cfg: dict) -> str:
